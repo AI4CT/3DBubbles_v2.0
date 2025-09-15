@@ -1,0 +1,15 @@
+joblib==1.4.2
+matplotlib==3.7.5
+numpy==1.24.1
+opencv_python==4.10.0.84
+Pillow==11.0.0
+pyinstrument==5.0.0
+pyvista==0.44.1
+scipy==1.14.1
+tqdm==4.67.0
+
+# GPU加速依赖
+torch>=1.9.0
+torchvision>=0.10.0
+kornia>=0.6.0
+cupy-cuda11x>=10.0.0  # 根据CUDA版本选择合适的cupy版本
