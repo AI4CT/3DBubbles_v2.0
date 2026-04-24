@@ -151,7 +151,27 @@ def generate_high_quality_bubble_image_from_pregenerated(original_image_path, or
                             output_filename = f'hq_bubble_{timestamp:05d}.png'
 
                     output_path = os.path.join(output_dir, output_filename)
-                    cv2.imwrite(output_path, bubble_image_data)
+
+                    # 标准化 HQ 图像方向：将长轴旋转为水平，使合成时只需旋转 render_angle 即可对齐
+                    import numpy as np
+                    hq_img = bubble_image_data.copy()
+                    try:
+                        hq_gray = cv2.cvtColor(hq_img, cv2.COLOR_BGR2GRAY) if len(hq_img.shape) == 3 else hq_img
+                        _, hq_bin = cv2.threshold(hq_gray, 180, 255, cv2.THRESH_BINARY)
+                        hq_conts, _ = cv2.findContours(hq_bin, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                        hq_conts = sorted(hq_conts, key=cv2.contourArea, reverse=True)
+                        if len(hq_conts) >= 2 and len(hq_conts[1]) >= 5:
+                            hq_ellipse = cv2.fitEllipse(hq_conts[1])
+                            hq_angle = hq_ellipse[2]
+                            center = (hq_img.shape[1] // 2, hq_img.shape[0] // 2)
+                            M = cv2.getRotationMatrix2D(center, hq_angle, 1.0)
+                            border_val = (255, 255, 255) if len(hq_img.shape) == 3 else 255
+                            hq_img = cv2.warpAffine(hq_img, M, (hq_img.shape[1], hq_img.shape[0]),
+                                                    borderValue=border_val)
+                    except Exception:
+                        pass  # 标准化失败时保留原图
+
+                    cv2.imwrite(output_path, hq_img)
 
                     print(f"    筛选成功: 相似度={similarity_score:.3f}, 索引={best_idx}")
 

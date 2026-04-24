@@ -86,18 +86,21 @@ def ellipsoid_fit(X):
     return center, evecs, radii, v
 
 
-def calculate_dynamic_canvas_size(points, scale_factor=1.3):
+def calculate_dynamic_canvas_size(points, scale_factor=1.3, min_canvas_size=None, enable_true_size=True):
     """
-    根据气泡点云计算动态画布大小
+    根据气泡点云计算动态画布大小（支持真实尺寸渲染）
 
     Args:
         points: 气泡的点云数据
         scale_factor: 缩放因子，确保气泡完全包含在画布内
+        min_canvas_size: 最小画布大小（None表示无限制，允许真实尺寸）
+        enable_true_size: 是否启用真实尺寸渲染（移除64像素限制）
 
     Returns:
         canvas_size: 正方形画布的边长（像素）
         scale: 从3D坐标到像素坐标的缩放比例
         offset_x, offset_y: 画布中心偏移量
+        size_info: 尺寸信息字典
     """
     # 计算点云的边界框
     x_min, x_max = np.min(points[:, 0]), np.max(points[:, 0])
@@ -118,8 +121,20 @@ def calculate_dynamic_canvas_size(points, scale_factor=1.3):
     if canvas_size % 2 != 0:
         canvas_size += 1
 
-    # 确保最小画布大小
-    canvas_size = max(canvas_size, 64)
+    # 记录原始计算的画布尺寸
+    original_calculated_size = canvas_size
+
+    # 尺寸限制处理
+    if enable_true_size:
+        # 启用真实尺寸：移除64像素硬编码限制，但保持合理的最小值
+        if min_canvas_size is not None:
+            canvas_size = max(canvas_size, min_canvas_size)
+        else:
+            # 设置一个非常小的最小值，确保至少有几个像素用于渲染
+            canvas_size = max(canvas_size, 4)  # 最小4×4像素，保证基本可见性
+    else:
+        # 保持原有的64像素限制（向后兼容）
+        canvas_size = max(canvas_size, 64)
 
     # 计算缩放比例
     scale = canvas_size / (max_size * scale_factor)
@@ -130,12 +145,26 @@ def calculate_dynamic_canvas_size(points, scale_factor=1.3):
     offset_x = canvas_size / 2 / scale - center_x
     offset_y = canvas_size / 2 / scale - center_y
 
-    return canvas_size, scale, offset_x, offset_y
+    # 创建尺寸信息记录
+    size_info = {
+        'original_calculated_size': original_calculated_size,
+        'final_canvas_size': canvas_size,
+        'was_size_limited': canvas_size != original_calculated_size,
+        'size_limit_applied': min_canvas_size if min_canvas_size and canvas_size == min_canvas_size else None,
+        'physical_width': width,
+        'physical_height': height,
+        'max_physical_size': max_size,
+        'scale_factor_applied': scale_factor,
+        'enable_true_size': enable_true_size
+    }
+
+    return canvas_size, scale, offset_x, offset_y, size_info
 
 
-def render_single_bubble(mesh, bubble_idx, point_fibonacci, v, output_dir, alpha=8, truncation=0.75):
+def render_single_bubble(mesh, bubble_idx, point_fibonacci, v, output_dir, alpha=8, truncation=0.75,
+                        enable_true_size=True, min_canvas_size=None):
     """
-    渲染单个气泡
+    渲染单个气泡（支持真实尺寸渲染）
 
     Args:
         mesh: 单个气泡的mesh对象
@@ -145,6 +174,8 @@ def render_single_bubble(mesh, bubble_idx, point_fibonacci, v, output_dir, alpha
         output_dir: 输出目录
         alpha: 角度权重指数
         truncation: 截断值
+        enable_true_size: 是否启用真实尺寸渲染（移除64像素限制）
+        min_canvas_size: 最小画布大小（None表示无限制）
 
     Returns:
         bubble_params: 包含3D和2D参数的字典
@@ -194,8 +225,10 @@ def render_single_bubble(mesh, bubble_idx, point_fibonacci, v, output_dir, alpha
             print(f"警告：气泡 {bubble_idx} 没有可见的点")
             return None
 
-        # 计算动态画布大小
-        canvas_size, scale, offset_x, offset_y = calculate_dynamic_canvas_size(filtered_points)
+        # 计算动态画布大小（启用真实尺寸渲染）
+        canvas_size, scale, offset_x, offset_y, size_info = calculate_dynamic_canvas_size(
+            filtered_points, scale_factor=1.3, min_canvas_size=min_canvas_size, enable_true_size=enable_true_size
+        )
 
         # 角度权重计算
         angles = filtered_normals[:, 2] / np.linalg.norm(filtered_normals, axis=1)
@@ -231,7 +264,8 @@ def render_single_bubble(mesh, bubble_idx, point_fibonacci, v, output_dir, alpha
                             mapped_points[x_idx, y_idx] = 0
                         mapped_points[x_idx, y_idx] += M[i] * (total - l) / total
 
-        return canvas_size, mapped_points, scale, offset_x, offset_y, {
+        # 合并3D参数和尺寸信息
+        bubble_3d_params = {
             'volume_3d': volume_3d,
             'surface_area_3d': surface_area_3d,
             'a': a, 'b': b, 'c': c,
@@ -240,25 +274,33 @@ def render_single_bubble(mesh, bubble_idx, point_fibonacci, v, output_dir, alpha
             'Convexity_3D': Convexity_3D
         }
 
+        # 添加尺寸信息
+        bubble_3d_params.update(size_info)
+
+        return canvas_size, mapped_points, scale, offset_x, offset_y, bubble_3d_params
+
     except Exception as e:
         print(f"渲染气泡 {bubble_idx} 时发生错误: {e}")
         return None
 
 
 def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x, offset_y,
-                                  bubble_params, bubble_idx, output_path, truncation=0.75):
+                                  bubble_params, bubble_idx, output_path, truncation=0.75,
+                                  target_size=128, enable_size_tracking=True):
     """
-    处理单气泡渲染的后处理和保存
+    处理单气泡渲染的后处理和保存（支持真实尺寸处理）
 
     Args:
         canvas_size: 原始画布大小
         mapped_points: 映射后的点数据
         scale: 缩放因子
         offset_x, offset_y: 偏移量
-        bubble_params: 3D参数字典
+        bubble_params: 3D参数字典（包含尺寸信息）
         bubble_idx: 气泡索引
         output_path: 输出路径
         truncation: 截断值
+        target_size: 目标标准化尺寸（默认128×128）
+        enable_size_tracking: 是否启用尺寸追踪
 
     Returns:
         final_params: 包含3D和2D参数的完整字典
@@ -296,13 +338,13 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
         mapped_points_normalized = cv2_enhance_contrast(mapped_points_normalized, 2)
         mapped_points_normalized = cv2.transpose(mapped_points_normalized)
 
-        # 图像尺寸标准化：基于原始尺寸选择处理策略
-        target_size = 128
+        # 图像尺寸标准化：基于原始尺寸选择处理策略（支持真实尺寸）
         processing_method = ""
         resize_scale_factor = 1.0
+        padding_info = None
 
         if original_canvas_size <= target_size:
-            # 小尺寸图像：使用填充策略
+            # 小尺寸图像：使用填充策略保持原始尺寸
             processing_method = "padding"
             resize_scale_factor = 1.0
 
@@ -313,6 +355,15 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
             pad_left = pad_total // 2
             pad_right = pad_total - pad_left
 
+            # 记录填充信息
+            padding_info = {
+                'pad_top': pad_top,
+                'pad_bottom': pad_bottom,
+                'pad_left': pad_left,
+                'pad_right': pad_right,
+                'pad_total': pad_total
+            }
+
             # 使用白色填充（255, 255, 255）
             mapped_points_normalized = cv2.copyMakeBorder(
                 mapped_points_normalized,
@@ -320,6 +371,10 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
                 cv2.BORDER_CONSTANT,
                 value=[255, 255, 255]
             )
+
+            # 对于非常小的气泡，记录真实尺寸信息
+            if enable_size_tracking and original_canvas_size < 64:
+                print(f"  小气泡真实尺寸保持: {bubble_idx} - 原始{original_canvas_size}×{original_canvas_size}像素，填充到{target_size}×{target_size}像素")
         else:
             # 大尺寸图像：使用缩放策略
             processing_method = "resize"
@@ -328,6 +383,9 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
             # 使用双线性插值进行resize
             mapped_points_normalized = cv2.resize(mapped_points_normalized, (target_size, target_size),
                                                 interpolation=cv2.INTER_LINEAR)
+
+            if enable_size_tracking:
+                print(f"  大气泡缩放处理: {bubble_idx} - 原始{original_canvas_size}×{original_canvas_size}像素，缩放到{target_size}×{target_size}像素（缩放因子: {resize_scale_factor:.3f}）")
 
         # 保存图像
         cv2.imwrite(output_path, mapped_points_normalized)
@@ -377,8 +435,10 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
         else:
             area_2d = convexity_2d = MA = ma = aspect_ratio_2d = circularity_2d = solidity_2d = 0
 
-        # 合并所有参数
+        # 合并所有参数（包含完整的尺寸追踪信息）
         final_params = bubble_params.copy()
+
+        # 添加2D渲染参数
         final_params.update({
             'canvas_size': canvas_size,  # 这里现在是原始画布大小
             'original_canvas_size': original_canvas_size,  # 原始画布边长
@@ -397,6 +457,30 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
             'convexity_2d': convexity_2d
         })
 
+        # 添加填充信息（如果使用了填充策略）
+        if padding_info:
+            final_params['padding_info'] = padding_info
+
+        # 添加尺寸一致性信息
+        if enable_size_tracking:
+            # 计算尺寸保真度（原始尺寸在最终图像中的占比）
+            size_fidelity = (original_canvas_size / target_size) ** 2  # 面积比
+
+            # 判断是否为真实尺寸渲染（未被64像素限制影响）
+            is_true_size_rendering = bubble_params.get('enable_true_size', False) and not bubble_params.get('was_size_limited', False)
+
+            final_params.update({
+                'size_fidelity': size_fidelity,
+                'is_true_size_rendering': is_true_size_rendering,
+                'size_tracking_enabled': True,
+                'original_to_final_ratio': original_canvas_size / target_size
+            })
+
+            # 如果是小气泡的真实尺寸渲染，添加特殊标记
+            if is_true_size_rendering and original_canvas_size < 64:
+                final_params['small_bubble_true_size'] = True
+                final_params['size_improvement_note'] = f"小气泡保持真实尺寸：{original_canvas_size}×{original_canvas_size}像素（未被强制放大到64×64）"
+
         return final_params
 
     except Exception as e:
@@ -411,6 +495,78 @@ def process_single_bubble_rendering(canvas_size, mapped_points, scale, offset_x,
         if 'binary_img' in locals():
             del binary_img
         gc.collect()
+
+
+def render_single_bubble_with_unified_scaling(mesh, bubble_idx, point_fibonacci, v, output_dir,
+                                            scaling_manager=None, bubble_id=None,
+                                            alpha=8, truncation=0.75, enable_true_size=True):
+    """
+    使用统一缩放系统渲染单个气泡
+
+    Args:
+        mesh: 单个气泡的mesh对象
+        bubble_idx: 气泡索引
+        point_fibonacci: 投影点
+        v: 旋转向量
+        output_dir: 输出目录
+        scaling_manager: 统一缩放管理器实例
+        bubble_id: 气泡唯一标识
+        alpha: 角度权重指数
+        truncation: 截断值
+        enable_true_size: 是否启用真实尺寸渲染
+
+    Returns:
+        final_params: 包含完整尺寸追踪信息的参数字典
+    """
+    try:
+        # 使用新的渲染函数
+        result = render_single_bubble(
+            mesh, bubble_idx, point_fibonacci, v, output_dir,
+            alpha=alpha, truncation=truncation,
+            enable_true_size=enable_true_size, min_canvas_size=None
+        )
+
+        if result is None:
+            return None
+
+        canvas_size, mapped_points, scale, offset_x, offset_y, bubble_3d_params = result
+
+        # 生成输出路径
+        output_path = f"{output_dir}/bubble_{bubble_idx:04d}.png"
+
+        # 处理渲染结果
+        final_params = process_single_bubble_rendering(
+            canvas_size, mapped_points, scale, offset_x, offset_y,
+            bubble_3d_params, bubble_idx, output_path, truncation=truncation,
+            target_size=128, enable_size_tracking=True
+        )
+
+        # 如果提供了统一缩放管理器，记录尺寸信息
+        if scaling_manager and bubble_id:
+            try:
+                # 创建渲染尺寸记录
+                rendering_info = {
+                    'bubble_id': bubble_id,
+                    'original_canvas_size': final_params.get('original_canvas_size', canvas_size),
+                    'final_canvas_size': 128,  # 标准化尺寸
+                    'processing_method': final_params.get('processing_method', 'unknown'),
+                    'size_fidelity': final_params.get('size_fidelity', 1.0),
+                    'is_true_size_rendering': final_params.get('is_true_size_rendering', False),
+                    'rendering_timestamp': str(np.datetime64('now'))
+                }
+
+                # 保存到缩放管理器（如果支持渲染记录）
+                if hasattr(scaling_manager, 'add_rendering_record'):
+                    scaling_manager.add_rendering_record(bubble_id, rendering_info)
+
+            except Exception as e:
+                print(f"记录渲染信息失败 {bubble_id}: {e}")
+
+        return final_params
+
+    except Exception as e:
+        print(f"统一缩放系统渲染气泡 {bubble_idx} 失败: {e}")
+        return None
 
 
 def pixel_coloring(masks_path, alpha, all_points, all_vectors, min_x, min_y, scale, canvas_range_x, canvas_range_y):

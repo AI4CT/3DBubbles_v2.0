@@ -74,6 +74,7 @@ from .flow_composition import (
 from .bubble_rendering import (
     render_single_bubble,
     process_single_bubble_rendering,
+    render_single_bubble_with_unified_scaling,
     pixel_coloring,
     cv2_enhance_contrast,
     ellipsoid_fit,
@@ -88,6 +89,26 @@ from .flow_generator import (
     upsample_and_scale_mesh,
     generate_points_in_cube
 )
+
+# 统一缩放系统
+try:
+    from .unified_scaling_system import (
+        UnifiedScalingManager,
+        OriginalGeometryInfo,
+        ScalingTransformation,
+        BubbleGeometryRecord
+    )
+
+    from .flow_generator_v2 import (
+        FlowGeneratorV2,
+        generater_v2,
+        upsample_and_scale_mesh_v2
+    )
+
+    UNIFIED_SCALING_AVAILABLE = True
+except ImportError as e:
+    print(f"统一缩放系统不可用: {e}")
+    UNIFIED_SCALING_AVAILABLE = False
 
 # 预生成数据集筛选系统
 try:
@@ -125,6 +146,7 @@ __all__ = [
     # bubble_rendering
     'render_single_bubble',
     'process_single_bubble_rendering',
+    'render_single_bubble_with_unified_scaling',
     'pixel_coloring',
     'cv2_enhance_contrast',
     'ellipsoid_fit',
@@ -137,3 +159,28 @@ __all__ = [
     'upsample_and_scale_mesh',
     'generate_points_in_cube'
 ]
+
+# 统一缩放系统导出（如果可用）
+if UNIFIED_SCALING_AVAILABLE:
+    __all__.extend([
+        'UnifiedScalingManager',
+        'OriginalGeometryInfo',
+        'ScalingTransformation',
+        'BubbleGeometryRecord',
+        'FlowGeneratorV2',
+        'generater_v2',
+        'upsample_and_scale_mesh_v2',
+        'UNIFIED_SCALING_AVAILABLE'
+    ])
+
+
+# 尺寸工具函数
+from .size_utils import (
+    extract_size_from_filename,
+    generate_filename_with_size,
+    remove_size_from_filename,
+    restore_image_size,
+    get_processing_method_from_size,
+    calculate_padding_params,
+    scale_image_to_standard_size
+)

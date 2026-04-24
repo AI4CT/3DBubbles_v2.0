@@ -18,6 +18,7 @@ import csv
 import cv2
 import numpy as np
 import random
+import re
 import math
 from scipy.ndimage import median_filter, gaussian_filter
 
@@ -337,20 +338,21 @@ def create_flow_field_composition(projection_dir, bubble_positions, projection_p
         return np.full((canvas_size, canvas_size, 3), 255, dtype=np.uint8), 0
 
 
-def cut_image_out_of_range(img, cx, cy, pad=None):
+def cut_image_out_of_range(img, cx, cy, pad=None, crop_size=128):
     """
     从图像中裁剪指定中心点的区域
 
     Args:
         img: 输入图像
         cx, cy: 中心点坐标
-        pad: 填充参数，如果为None则使用128x128裁剪
+        pad: 填充参数，如果为None则使用crop_size x crop_size裁剪
+        crop_size: 裁剪尺寸，默认128
 
     Returns:
         裁剪后的图像
     """
     if pad is None:
-        w, h = 128, 128
+        w, h = crop_size, crop_size
         a = cx - w/2
         b = cx + w/2
         c = cy - h/2
@@ -421,8 +423,9 @@ def rotate_and_mask_bubble(bubble_img, angle, threshold=50):
     Returns:
         tuple: (旋转后的图像, 掩码, 轮廓)
     """
-    # 预处理图像
-    img = cv2.bitwise_not(bubble_img).reshape(128, 128, 1)
+    # 预处理图像 - 支持动态尺寸
+    height, width = bubble_img.shape
+    img = cv2.bitwise_not(bubble_img).reshape(height, width, 1)
     img = img.repeat(3, -1)
     rows, cols, _ = img.shape
 
@@ -553,7 +556,8 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                                    location_dis='gaussian', x_e=0.5, x_sd=175, x_pad=24,
                                    threshold=50, enable_gauss=True, enable_median=True,
                                    save_outputs=True, use_3d_positions=True,
-                                   min_x=None, min_y=None, auto_adjust_canvas=True):
+                                   min_x=None, min_y=None, auto_adjust_canvas=True,
+                                   save_pre_stitch=True):
     """
     生成完整的流场合成图像（参考generate_flow_field_overlap.py的实现）
 
@@ -584,58 +588,137 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
     """
     try:
         print(f"开始生成完整流场合成，气泡数量: {len(bubble_analysis_data)}")
-
-        # 动态调整画布尺寸和填充（如果启用且使用3D位置）
-        if auto_adjust_canvas and use_3d_positions and bubble_positions and min_x is not None and min_y is not None:
-            adjusted_params = calculate_optimal_canvas_parameters(
-                bubble_positions, min_x, min_y, scale_factor,
-                width_pix, height_pix, pad
-            )
-            width_pix = adjusted_params['width_pix']
-            height_pix = adjusted_params['height_pix']
-            pad = adjusted_params['pad']
-            print(f"  自动调整画布参数: 尺寸={width_pix}x{height_pix}, 填充={pad}")
-
-        # 初始化画布
-        background = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8)
-        background_global_gauss = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_gauss else None
-        background_local_gauss = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_gauss else None
-        background_global_median = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_median else None
-        background_local_median = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_median else None
-
-        # 存储气泡信息
-        bubble_labels = []
-        bubble_masks = []
-        bub_conts = []
-        bub_conts_pad = []
-        processed_bubbles = []
-
-        # 确定气泡处理顺序和位置信息
-        if use_3d_positions and bubble_positions and projection_point is not None and v_vector is not None:
-            # 使用3D位置信息，按深度排序（与原始渲染保持一致）
-            print(f"  使用3D位置信息进行合成，气泡数量: {len(bubble_positions)}")
-            sorted_indices = sort_bubbles_by_depth(bubble_positions, projection_point, v_vector)
-
-            # 将分析数据按索引重新组织
-            analysis_items = list(bubble_analysis_data.items())
-            if len(analysis_items) != len(bubble_positions):
-                print(f"  警告：分析数据数量({len(analysis_items)})与位置数据数量({len(bubble_positions)})不匹配")
-                # 取较小的数量
-                min_count = min(len(analysis_items), len(bubble_positions))
-                analysis_items = analysis_items[:min_count]
-                sorted_indices = [i for i in sorted_indices if i < min_count]
-
-            # 按深度排序重新组织数据
-            sorted_items = [(analysis_items[i][0], analysis_items[i][1], bubble_positions[i], i)
-                          for i in sorted_indices if i < len(analysis_items)]
+ 
+        import re
+ 
+        # 提取原始索引并过滤到仅成功气泡
+        idx_to_analysis = {}
+        for path, analysis_result in bubble_analysis_data.items():
+            basename = os.path.basename(path)
+            match = re.search(r'bubble_(\d+)', basename)
+            if match:
+                try:
+                    idx = int(match.group(1))
+                    idx_to_analysis[idx] = (path, analysis_result)
+                except ValueError:
+                    print(f"  警告: 无法解析索引从路径 {path}")
+                    continue
+ 
+        if not idx_to_analysis:
+            print("  错误: 无法从文件名提取任何有效索引，使用随机位置模式")
+            use_3d_positions = False
         else:
-            # 使用随机位置采样，按边缘锐利度排序
-            print(f"  使用随机位置采样进行合成")
-            sorted_items = [(path, data, None, i) for i, (path, data) in
-                          enumerate(sorted(bubble_analysis_data.items(),
-                                         key=lambda x: x[1].get('edge_gradient', 0), reverse=True))]
+            successful_indices = sorted(idx_to_analysis.keys())
+            print(f"  成功气泡索引: {len(successful_indices)} 个 (原始位置总数: {len(bubble_positions)})")
+ 
+            if bubble_positions is None:
+                print("  警告: 未提供3D位置数据，降级为随机位置模式")
+                use_3d_positions = False
+ 
+            if use_3d_positions and len(successful_indices) < len(bubble_positions):
+                print(f"  警告: 筛选后气泡数量减少，仅使用成功气泡的位置")
+ 
+            # 构建分析序列并尝试匹配3D位置
+            analysis_entries = []
+            missing_position_indices = []
+            for idx in successful_indices:
+                path, analysis = idx_to_analysis[idx]
+                position = None
+                if bubble_positions is not None and idx < len(bubble_positions):
+                    position = bubble_positions[idx]
+                else:
+                    missing_position_indices.append(idx)
+                analysis_entries.append({
+                    'path': path,
+                    'analysis': analysis,
+                    'idx': idx,
+                    'position': position
+                })
+ 
+            if not analysis_entries:
+                print("  错误: 没有有效的分析数据，使用随机位置模式")
+                use_3d_positions = False
+ 
+            if use_3d_positions and (projection_point is None or v_vector is None or min_x is None or min_y is None):
+                print("  警告: 3D位置合成缺少必要的投影参数，降级为随机位置模式")
+                use_3d_positions = False
+ 
+            valid_position_entries = [entry for entry in analysis_entries if entry['position'] is not None]
+            filtered_positions = [entry['position'] for entry in valid_position_entries]
+ 
+            if use_3d_positions and not filtered_positions:
+                print("  警告: 没有可用的3D位置数据，降级为随机位置模式")
+                use_3d_positions = False
+ 
+            if use_3d_positions and missing_position_indices:
+                print(f"  警告: {len(missing_position_indices)} 个气泡缺少3D位置，将改用随机位置渲染: {missing_position_indices}")
+ 
+            # 初始化画布
+            if auto_adjust_canvas and use_3d_positions and filtered_positions:
+                adjusted_params = calculate_optimal_canvas_parameters(
+                    filtered_positions, min_x, min_y, scale_factor,
+                    width_pix, height_pix, pad
+                )
+                width_pix = adjusted_params['width_pix']
+                height_pix = adjusted_params['height_pix']
+                pad = adjusted_params['pad']
+                print(f"  自动调整画布参数: 尺寸={width_pix}x{height_pix}, 填充={pad}")
+ 
+            background = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8)
+            background_global_gauss = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_gauss else None
+            background_local_gauss = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_gauss else None
+            background_global_median = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_median else None
+            background_local_median = np.zeros((height_pix + pad * 2, width_pix + pad * 2, 3), np.uint8) if enable_median else None
+ 
+            # 存储气泡信息
+            bubble_labels = []
+            bubble_masks = []
+            bub_conts = []
+            bub_conts_pad = []
+            processed_bubbles = []
+ 
+            sorted_items = []
+            if use_3d_positions:
+                print(f"  使用3D位置信息进行合成，气泡数量: {len(filtered_positions)}")
+                depth_order = sort_bubbles_by_depth(filtered_positions, projection_point, v_vector)
+                depth_order = list(reversed(depth_order))
+                for order_idx in depth_order:
+                    if order_idx >= len(valid_position_entries):
+                        print(f"  警告: 深度排序索引 {order_idx} 超出有效位置范围，跳过")
+                        continue
+                    entry = valid_position_entries[order_idx]
+                    sorted_items.append((entry['path'], entry['analysis'], entry['position'], entry['idx']))
+ 
+                fallback_entries = [entry for entry in analysis_entries if entry['position'] is None]
+                if fallback_entries:
+                    fallback_entries_sorted = sorted(
+                        fallback_entries,
+                        key=lambda entry: entry['analysis'].get('edge_gradient', 0),
+                        reverse=True
+                    )
+                    for entry in fallback_entries_sorted:
+                        sorted_items.append((entry['path'], entry['analysis'], None, entry['idx']))
+                    print(f"  已将 {len(fallback_entries_sorted)} 个缺少3D位置的气泡加入随机位置队列")
+ 
+                if len(sorted_items) != len(analysis_entries):
+                    print(f"  警告: 成功匹配的气泡数量 {len(sorted_items)} 与分析结果数量 {len(analysis_entries)} 不一致")
+            else:
+                print(f"  使用随机位置采样进行合成")
+                fallback_entries_sorted = sorted(
+                    analysis_entries,
+                    key=lambda entry: entry['analysis'].get('edge_gradient', 0),
+                    reverse=True
+                )
+                for entry in fallback_entries_sorted:
+                    sorted_items.append((entry['path'], entry['analysis'], None, entry['idx']))
 
         successful_compositions = 0
+
+        # 创建拼接前图像保存目录
+        pre_stitch_dir = None
+        if save_pre_stitch:
+            pre_stitch_dir = os.path.join(projection_dir, 'pre_stitch_bubbles')
+            os.makedirs(pre_stitch_dir, exist_ok=True)
 
         for item in sorted_items:
             if len(item) == 4:
@@ -648,12 +731,23 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 # 强制只使用高质量图像，不提供备选机制
                 base_name = os.path.basename(image_rel_path)
 
+                # 检测原始文件名是否包含尺寸信息
+                size_match = re.search(r'_size(\d+)', base_name)
+                original_size = None
+                if size_match:
+                    original_size = int(size_match.group(1))
+                    # 去掉尺寸后缀生成高质量文件名
+                    base_name_without_size = re.sub(r'_size\d+', '', base_name)
+                    print(f"  检测到原始尺寸信息: {original_size}x{original_size}, 基础文件名: {base_name_without_size}")
+                else:
+                    base_name_without_size = base_name
+
                 # 转换文件名：bubble_000.png -> hq_bubble_000.png
-                if base_name.startswith('bubble_'):
-                    hq_filename = 'hq_' + base_name
+                if base_name_without_size.startswith('bubble_'):
+                    hq_filename = 'hq_' + base_name_without_size
                 else:
                     # 如果文件名不是标准格式，尝试添加hq_前缀
-                    hq_filename = 'hq_' + base_name
+                    hq_filename = 'hq_' + base_name_without_size
 
                 bubble_image_path = os.path.join(projection_dir, 'high_quality_renders', hq_filename)
 
@@ -669,6 +763,24 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 if bubble_img is None:
                     print(f"  无法加载气泡图像: {bubble_image_path}")
                     continue
+
+                # 根据原始尺寸决定是否需要恢复图像尺寸
+                if original_size is not None and original_size > 128:
+                    # 大尺寸图像：从128x128恢复到原始尺寸
+                    print(f"  检测到大尺寸图像，恢复图像尺寸: 从128x128恢复到{original_size}x{original_size}")
+                    # 使用双线性插值进行高质量缩放
+                    bubble_img = cv2.resize(bubble_img, (original_size, original_size), interpolation=cv2.INTER_LINEAR)
+                    print(f"  图像尺寸恢复完成: {bubble_img.shape}")
+                elif original_size is not None and original_size < 128:
+                    # 小尺寸图像：已经通过填充处理为128x128，无需恢复
+                    print(f"  检测到小尺寸图像(原始{original_size}x{original_size})，使用填充后的128x128尺寸: {bubble_img.shape}")
+                else:
+                    # 标准尺寸或无尺寸信息
+                    print(f"  使用标准128x128尺寸: {bubble_img.shape}")
+
+                # 提前计算气泡尺寸，后续位置验证和写回均需使用
+                bubble_size = bubble_img.shape[0]
+                half_size = bubble_size // 2
 
                 # 确定气泡位置
                 if bubble_3d_pos is not None and projection_point is not None and v_vector is not None:
@@ -696,8 +808,8 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                         raise ValueError(error_msg)
 
                     # 验证坐标并应用回退策略
-                    valid_x_range = (64, width_pix + pad * 2 - 64)
-                    valid_y_range = (64, height_pix + pad * 2 - 64)
+                    valid_x_range = (half_size, width_pix + pad * 2 - half_size)
+                    valid_y_range = (half_size, height_pix + pad * 2 - half_size)
 
                     if not (valid_x_range[0] <= x <= valid_x_range[1] and valid_y_range[0] <= y <= valid_y_range[1]):
                         print(f"  警告: 3D位置映射超出范围 - 3D{bubble_3d_pos} -> 2D({x}, {y}), 有效范围: x{valid_x_range}, y{valid_y_range}")
@@ -716,19 +828,11 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                     print(f"  使用随机位置: ({x-pad}, {y-pad})")
 
                 # 获取旋转角度（从分析结果中获取，或随机生成）
-                base_angle = analysis_result.get('angle', np.random.uniform(-180, 180))
+                # 画布最终经过 cv2.transpose，但气泡内容在贴入前已预转置，
+                # 两次转置相消（T∘T=I），最终朝向等于渲染时的角度，无需额外补偿。
+                angle = analysis_result.get('angle', np.random.uniform(-180, 180))
 
-                # 修复90度角度偏差：在基础角度上增加90度顺时针旋转
-                # 这确保增强流场合成与原始3D渲染的气泡方向完全匹配
-                angle = base_angle + 90.0
-
-                # 将角度规范化到[-180, 180]范围内
-                while angle > 180:
-                    angle -= 360
-                while angle <= -180:
-                    angle += 360
-
-                print(f"    气泡旋转角度: 基础角度={base_angle:.1f}°, 修正后角度={angle:.1f}°")
+                print(f"    气泡旋转角度: {angle:.1f}°")
 
                 # 旋转气泡并生成掩码
                 rotated_img, mask_with_contour, main_contour = rotate_and_mask_bubble(bubble_img, angle, threshold)
@@ -736,12 +840,29 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 if rotated_img is None or mask_with_contour is None or main_contour is None:
                     continue
 
-                # 生成全局掩码
+                # ── 坐标系对齐：旋转完成后立即转置，与画布最终 cv2.transpose 一致 ──
+                # 所有变换在此处一次完成，后续 ROI提取、增强、贴图均在同一坐标系中操作
+                rotated_img = cv2.transpose(rotated_img)
+                mask_with_contour = cv2.transpose(mask_with_contour)
+                tc = main_contour.copy()
+                tc[:, 0, 0] = main_contour[:, 0, 1]  # new_x = old_y
+                tc[:, 0, 1] = main_contour[:, 0, 0]  # new_y = old_x
+                main_contour = tc
+
+                # 保存拼接前的单气泡图像（旋转+坐标对齐后的最终状态）
+                if save_pre_stitch and pre_stitch_dir is not None:
+                    pre_stitch_vis = cv2.bitwise_not(rotated_img)
+                    bg_region = cv2.bitwise_not(mask_with_contour)
+                    pre_stitch_vis[bg_region > 0] = 255
+                    save_name = f'pre_stitch_{bubble_idx:03d}_angle{angle:.1f}.png'
+                    cv2.imwrite(os.path.join(pre_stitch_dir, save_name), pre_stitch_vis)
+
+                # 生成全局掩码（边界裁剪，mask_with_contour 已转置，索引仍对应同一像素）
                 global_mask = np.zeros((height_pix + pad * 2, width_pix + pad * 2), dtype=np.uint8)
-                x0, y0 = max(0, x - 64), max(0, y - 64)
-                x1, y1 = min(width_pix + pad * 2, x + 64), min(height_pix + pad * 2, y + 64)
-                mask_x0, mask_y0 = max(0, 64 - x), max(0, 64 - y)
-                mask_x1, mask_y1 = min(128, 128 - (x + 64 - (width_pix + pad * 2))), min(128, 128 - (y + 64 - (height_pix + pad * 2)))
+                x0, y0 = max(0, x - half_size), max(0, y - half_size)
+                x1, y1 = min(width_pix + pad * 2, x + half_size), min(height_pix + pad * 2, y + half_size)
+                mask_x0, mask_y0 = max(0, half_size - x), max(0, half_size - y)
+                mask_x1, mask_y1 = min(bubble_size, bubble_size - (x + half_size - (width_pix + pad * 2))), min(bubble_size, bubble_size - (y + half_size - (height_pix + pad * 2)))
 
                 if x1 > x0 and y1 > y0 and mask_x1 > mask_x0 and mask_y1 > mask_y0:
                     global_mask[y0:y1, x0:x1] = mask_with_contour[mask_y0:mask_y1, mask_x0:mask_x1]
@@ -753,35 +874,45 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 bubble_labels.append(label_val)
                 bubble_masks.append(global_mask)
 
-                # 处理轮廓坐标
-                origin_contour = main_contour[:, 0, :].copy()
+                # 轮廓坐标：main_contour 已在上方完成转置，直接加偏移
                 bub_conts_pad.append(main_contour.copy())
                 adjusted_contour = main_contour.copy()
-                adjusted_contour[:, 0, 0] += x - pad - 64
-                adjusted_contour[:, 0, 1] += y - pad - 64
+                adjusted_contour[:, 0, 0] += x - pad - half_size
+                adjusted_contour[:, 0, 1] += y - pad - half_size
                 bub_conts.append(adjusted_contour)
 
-                # 提取ROI区域
-                roi = cut_image_out_of_range(background, x, y)
-                roi_global_gauss = cut_image_out_of_range(background_global_gauss, x, y) if enable_gauss else None
-                roi_local_gauss = cut_image_out_of_range(background_local_gauss, x, y) if enable_gauss else None
-                roi_global_median = cut_image_out_of_range(background_global_median, x, y) if enable_median else None
-                roi_local_median = cut_image_out_of_range(background_local_median, x, y) if enable_median else None
+                # 提取ROI区域（此时 background 和 rotated_img 已在同一坐标系）
+                roi = cut_image_out_of_range(background, x, y, crop_size=bubble_size)
+                roi_global_gauss = cut_image_out_of_range(background_global_gauss, x, y, crop_size=bubble_size) if enable_gauss else None
+                roi_local_gauss = cut_image_out_of_range(background_local_gauss, x, y, crop_size=bubble_size) if enable_gauss else None
+                roi_global_median = cut_image_out_of_range(background_global_median, x, y, crop_size=bubble_size) if enable_median else None
+                roi_local_median = cut_image_out_of_range(background_local_median, x, y, crop_size=bubble_size) if enable_median else None
 
                 # 准备前景图像
                 img_fg = cv2.bitwise_and(rotated_img, rotated_img, mask=mask_with_contour)
 
-                # 应用视觉增强
+                # 应用视觉增强（contour 坐标与 rotated_img 完全对齐）
                 enhanced_results = apply_visual_enhancement(roi, img_fg, mask_with_contour, main_contour, enable_gauss, enable_median)
 
-                # 合成到背景
-                background[y - 64 : y + 64, x - 64 : x + 64] = enhanced_results['basic']
-                if enable_gauss:
-                    background_global_gauss[y - 64 : y + 64, x - 64 : x + 64] = enhanced_results['global_gauss']
-                    background_local_gauss[y - 64 : y + 64, x - 64 : x + 64] = enhanced_results['local_gauss']
-                if enable_median:
-                    background_global_median[y - 64 : y + 64, x - 64 : x + 64] = enhanced_results['global_median']
-                    background_local_median[y - 64 : y + 64, x - 64 : x + 64] = enhanced_results['local_median']
+                # 贴图：变换已全部完成，直接写入画布（带边界裁剪防负索引）
+                H_bg = height_pix + pad * 2
+                W_bg = width_pix + pad * 2
+                bg_r0 = max(0, y - half_size);  bg_r1 = min(H_bg, y + half_size)
+                bg_c0 = max(0, x - half_size);  bg_c1 = min(W_bg, x + half_size)
+                et_r0 = bg_r0 - (y - half_size);  et_r1 = bg_r1 - (y - half_size)
+                et_c0 = bg_c0 - (x - half_size);  et_c1 = bg_c1 - (x - half_size)
+
+                if bg_r1 > bg_r0 and bg_c1 > bg_c0:
+                    def _paste(canvas, src):
+                        canvas[bg_r0:bg_r1, bg_c0:bg_c1] = src[et_r0:et_r1, et_c0:et_c1]
+
+                    _paste(background, enhanced_results['basic'])
+                    if enable_gauss:
+                        _paste(background_global_gauss, enhanced_results['global_gauss'])
+                        _paste(background_local_gauss,  enhanced_results['local_gauss'])
+                    if enable_median:
+                        _paste(background_global_median, enhanced_results['global_median'])
+                        _paste(background_local_median,  enhanced_results['local_median'])
 
                 # 记录处理成功的气泡信息
                 bubble_info = {
@@ -798,9 +929,9 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 successful_compositions += 1
 
             except (FileNotFoundError, ValueError) as e:
-                # 对于关键错误（高质量图像不存在、坐标映射错误），立即停止处理
-                print(f"处理气泡 {image_rel_path} 时出错: {e}")
-                raise e
+                # HQ 图像缺失或坐标映射失败时跳过该气泡，继续处理其余气泡
+                print(f"  跳过气泡 {image_rel_path}: {e}")
+                continue
             except Exception as e:
                 # 对于其他错误，记录并继续处理
                 print(f"处理气泡 {image_rel_path} 时出错: {e}")
@@ -832,6 +963,22 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
             background_local_median = cv2.bitwise_not(background_local_median)
             results['global_median'] = background_global_median[pad : height_pix + pad, pad : width_pix + pad]
             results['local_median'] = background_local_median[pad : height_pix + pad, pad : width_pix + pad]
+
+        # 转置所有输出图像，与 bubbly_flow.png 坐标系对齐
+        # bubbly_flow.png 经 pixel_coloring（axis-0=物理X）→ .T → cv2.transpose 后：
+        #   rows=物理X，cols=物理Y（非标准图像约定）
+        # 合成画布：rows=物理Y，cols=物理X（标准图像约定）
+        # cv2.transpose 将 (rows=Y, cols=X) 转为 (rows=X, cols=Y)，二者对齐
+        for key in ('basic', 'global_gauss', 'local_gauss', 'global_median', 'local_median'):
+            if key in results:
+                results[key] = cv2.transpose(results[key])
+
+        # 同步变换轮廓坐标：转置后 new_x = old_y, new_y = old_x
+        for cont in bub_conts:
+            old_x = cont[:, 0, 0].copy()
+            old_y = cont[:, 0, 1].copy()
+            cont[:, 0, 0] = old_y
+            cont[:, 0, 1] = old_x
 
         # 保存输出文件
         if save_outputs:

@@ -105,6 +105,7 @@ try:
     from .image_generation import generate_high_quality_bubble_image
     from .flow_composition import create_flow_field_composition, load_bubble_positions, generate_flow_field_composition
     from .bubble_rendering import render_single_bubble, process_single_bubble_rendering, pixel_coloring, cv2_enhance_contrast
+    from .size_utils import generate_filename_with_size, extract_size_from_filename
 except ImportError:
     from bubble_analysis import analyze_bubble_image
     from image_generation import generate_high_quality_bubble_image
@@ -157,27 +158,57 @@ def upsample_point_cloud(points, num_clusters, sample_spacing):
 
 def upsample_and_scale_mesh(stl_files, num_clusters, chosen_volume, sample_spacing):
     """
-    上采样和缩放mesh
-    
+    上采样和缩放mesh（保持向后兼容，内部使用统一缩放系统）
+
     Args:
         stl_files: STL文件列表
         num_clusters: 目标点数
         chosen_volume: 目标体积
         sample_spacing: 采样间距
-    
+
     Returns:
         tuple: (stl_file, mesh, mesh_origin, chosen_volume)
     """
-    stl_file = random.choice(stl_files)
-    mesh_origin = pv.read(stl_file)
-    mesh = upsample_point_cloud(mesh_origin.points, num_clusters, sample_spacing)
-    mesh.smooth_taubin(n_iter=10, pass_band=5, inplace=True)
-    mesh = mesh.fill_holes(100)
-    volume = mesh.volume
-    scale_factor = (chosen_volume / volume) ** (1/3)
-    mesh.points *= scale_factor
-    mesh_origin.points *= scale_factor
-    return stl_file, mesh, mesh_origin, chosen_volume
+    try:
+        # 导入统一缩放系统
+        from .unified_scaling_system import UnifiedScalingManager
+
+        stl_file = random.choice(stl_files)
+
+        # 使用统一缩放管理器（临时实例，不启用追踪以保持性能）
+        scaling_manager = UnifiedScalingManager("/tmp", enable_size_tracking=False)
+        processed_mesh, original_mesh, original_info, scaling_info = scaling_manager.process_and_scale_mesh(
+            stl_file, chosen_volume, num_clusters, sample_spacing
+        )
+
+        # 为了向后兼容，返回原有格式
+        return stl_file, processed_mesh, original_mesh, chosen_volume
+
+    except ImportError:
+        # 如果统一缩放系统不可用，回退到原有实现
+        print("警告：统一缩放系统不可用，使用原有实现")
+        stl_file = random.choice(stl_files)
+        mesh_origin = pv.read(stl_file)
+        mesh = upsample_point_cloud(mesh_origin.points, num_clusters, sample_spacing)
+        mesh.smooth_taubin(n_iter=10, pass_band=5, inplace=True)
+        mesh = mesh.fill_holes(100)
+        volume = mesh.volume
+        scale_factor = (chosen_volume / volume) ** (1/3)
+        mesh.points *= scale_factor
+        mesh_origin.points *= scale_factor
+        return stl_file, mesh, mesh_origin, chosen_volume
+    except Exception as e:
+        print(f"统一缩放系统处理失败，回退到原有实现: {e}")
+        stl_file = random.choice(stl_files)
+        mesh_origin = pv.read(stl_file)
+        mesh = upsample_point_cloud(mesh_origin.points, num_clusters, sample_spacing)
+        mesh.smooth_taubin(n_iter=10, pass_band=5, inplace=True)
+        mesh = mesh.fill_holes(100)
+        volume = mesh.volume
+        scale_factor = (chosen_volume / volume) ** (1/3)
+        mesh.points *= scale_factor
+        mesh_origin.points *= scale_factor
+        return stl_file, mesh, mesh_origin, chosen_volume
 
 
 def generate_points_in_cube(num_points, cube_size=np.array([100,100,100]), num=100, poisson_max_iter = 100000):
@@ -230,6 +261,7 @@ def process_projection(mp_args):
     all_vectors = [mesh.point_normals for mesh in meshes]
     volume_size_x = max([np.max(point[:, 0]) for point in all_points]) - min([np.min(point[:, 0]) for point in all_points])
     volume_size_y = max([np.max(point[:, 1]) for point in all_points]) - min([np.min(point[:, 1]) for point in all_points])
+    volume_height = max([np.max(point[:, 2]) for point in all_points]) - min([np.min(point[:, 2]) for point in all_points])  # 计算Z方向高度，用于简单流场合成
     canvas_range_x = int(scale * volume_size_x)
     canvas_range_y = int(scale * volume_size_y)
 
@@ -345,9 +377,10 @@ def process_projection(mp_args):
 
     for bubble_idx, mesh in enumerate(allocated_meshes):
         try:
-            # 渲染单个气泡
+            # 渲染单个气泡（启用真实尺寸渲染）
             render_result = render_single_bubble(mesh, bubble_idx, point_fibonacci, v,
-                                               single_bubble_dir, alpha, truncation)
+                                               single_bubble_dir, alpha, truncation,
+                                               enable_true_size=True, min_canvas_size=None)
 
             if render_result is not None:
                 canvas_size, mapped_points, scale_factor, offset_x, offset_y, bubble_3d_params = render_result
@@ -355,19 +388,19 @@ def process_projection(mp_args):
                 # 临时输出路径
                 temp_bubble_image_path = os.path.join(single_bubble_dir, f'temp_bubble_{bubble_idx:03d}.png')
 
-                # 后处理和保存
+                # 后处理和保存（启用尺寸追踪）
                 final_params = process_single_bubble_rendering(
                     canvas_size, mapped_points, scale_factor, offset_x, offset_y,
-                    bubble_3d_params, bubble_idx, temp_bubble_image_path, truncation
+                    bubble_3d_params, bubble_idx, temp_bubble_image_path, truncation,
+                    target_size=128, enable_size_tracking=True
                 )
 
-                # 根据处理方式确定最终文件名
-                if final_params.get('processing_method') == 'padding':
-                    # 小尺寸图像使用填充，文件名不包含原始尺寸
-                    final_bubble_image_path = os.path.join(single_bubble_dir, f'bubble_{bubble_idx:03d}.png')
-                else:
-                    # 大尺寸图像使用缩放，文件名包含原始尺寸
-                    final_bubble_image_path = os.path.join(single_bubble_dir, f'bubble_{bubble_idx:03d}_size{canvas_size}.png')
+                # 所有文件名都包含原始尺寸信息
+                original_canvas_size = final_params.get('original_canvas_size', canvas_size)
+                base_filename = f'bubble_{bubble_idx:03d}.png'
+                final_bubble_image_path = os.path.join(single_bubble_dir, generate_filename_with_size(base_filename, original_canvas_size))
+                
+                print(f"  保存气泡图像: {os.path.basename(final_bubble_image_path)} (原始尺寸: {original_canvas_size}x{original_canvas_size}, 处理方法: {final_params.get('processing_method', 'unknown')})")
 
                 # 重命名文件
                 if os.path.exists(temp_bubble_image_path):
@@ -492,14 +525,19 @@ def process_projection(mp_args):
                         screening_results['failed'].append(bubble_image_path)
 
             # 处理筛选结果
-            for image_path, analysis_result in screening_results['analysis_data'].items():
-                # 使用相对路径
-                relative_path = os.path.relpath(image_path, base_path)
-
-                # 格式化分析结果为txt格式
-                analysis_line = f"{relative_path}\t{analysis_result['angle']:.6f}\t{analysis_result['major_axis_length']:.6f}\t{analysis_result['minor_axis_length']:.6f}\t{analysis_result['centroid_x']:.6f}\t{analysis_result['centroid_y']:.6f}\t{analysis_result['circularity']:.6f}\t{analysis_result['solidity']:.6f}\t{analysis_result['shadow_ratio']:.6f}\t{analysis_result['edge_gradient']:.6f}"
-                analysis_results.append(analysis_line)
-                analysis_success_count += 1
+            for image_path in screening_results['passed']:
+                if image_path in screening_results['analysis_data']:
+                    analysis_result = screening_results['analysis_data'][image_path]
+                    # 使用相对路径
+                    relative_path = os.path.relpath(image_path, base_path)
+     
+                    # 格式化分析结果为txt格式
+                    # 使用 original_angle（渲染图像标准化前的真实朝向角度）
+                    # GPU路径只有 'angle'（原始椭圆角），CPU路径有 'original_angle'（标准化前的角度）
+                    render_angle = analysis_result.get('original_angle', analysis_result.get('angle', 0.0))
+                    analysis_line = f"{relative_path}\t{render_angle:.6f}\t{analysis_result['major_axis_length']:.6f}\t{analysis_result['minor_axis_length']:.6f}\t{analysis_result['centroid_x']:.6f}\t{analysis_result['centroid_y']:.6f}\t{analysis_result['circularity']:.6f}\t{analysis_result['solidity']:.6f}\t{analysis_result['shadow_ratio']:.6f}\t{analysis_result['edge_gradient']:.6f}"
+                    analysis_results.append(analysis_line)
+                    analysis_success_count += 1
 
             passed_count = len(screening_results['passed'])
             total_count = len(bubble_image_paths)
@@ -744,7 +782,7 @@ def process_projection(mp_args):
                         # 传递原始渲染的坐标参数
                         min_x=min_x,
                         min_y=min_y,
-                        auto_adjust_canvas=True  # 启用自动画布调整
+                        auto_adjust_canvas=False  # 禁用：canvas_range_x/y已精确覆盖流场，auto_adjust混用旋转前后坐标系会导致尺寸错误
                     )
 
                     success_count = composition_results.get('successful_compositions', 0)
@@ -874,11 +912,69 @@ def generater(stl_files, base_path, volume_size_x, volume_size_y, volume_height,
             points = generate_points_in_cube(len(meshes),
                                                 cube_size=np.array([volume_size_x, volume_size_y, volume_height]) * 1.2, poisson_max_iter = poisson_max_iter)
 
-            for mesh, mesh_origin, point in zip(meshes, meshes_origin, points):
-                mesh.points += point
-                allocated_meshes.append(mesh)
-                mesh_origin.points += point
-                allocated_origin_meshes.append(mesh_origin)
+            # 使用统一缩放系统进行位置分配（如果可用）
+            try:
+                from .unified_scaling_system import UnifiedScalingManager
+
+                # 创建临时缩放管理器用于位置分配
+                temp_scaling_manager = UnifiedScalingManager(base_path, enable_size_tracking=True)
+
+                # 记录原始信息和应用位置偏移
+                for i, (mesh, mesh_origin, point) in enumerate(zip(meshes, meshes_origin, points)):
+                    bubble_id = f"bubble_{gas_idx}_{i:04d}"
+
+                    # 应用位置偏移（保持原有逻辑）
+                    mesh.points += point
+                    mesh_origin.points += point
+
+                    allocated_meshes.append(mesh)
+                    allocated_origin_meshes.append(mesh_origin)
+
+                    # 如果有STL文件信息，创建几何记录
+                    if i < len(names):
+                        try:
+                            # 提取原始几何信息
+                            original_info = temp_scaling_manager.extract_original_geometry_info(names[i])
+
+                            # 创建缩放变换信息
+                            from .unified_scaling_system import ScalingTransformation
+                            scaling_info = ScalingTransformation(
+                                volume_scale_factor=1.0,  # 已经应用过缩放
+                                target_volume=volumes[i] / 10 if i < len(volumes) else 0.0,
+                                position_offset=list(point),
+                                transformation_timestamp=str(np.datetime64('now'))
+                            )
+
+                            # 创建气泡几何记录
+                            bubble_record = temp_scaling_manager.create_bubble_geometry_record(
+                                bubble_id, original_info, scaling_info, mesh
+                            )
+
+                        except Exception as record_error:
+                            print(f"创建气泡记录失败 {bubble_id}: {record_error}")
+
+                # 保存尺寸映射
+                try:
+                    mapping_file = temp_scaling_manager.save_size_mapping()
+                    print(f"尺寸映射已保存: {mapping_file}")
+                except Exception as save_error:
+                    print(f"保存尺寸映射失败: {save_error}")
+
+            except ImportError:
+                # 回退到原有实现
+                print("统一缩放系统不可用，使用原有位置分配逻辑")
+                for mesh, mesh_origin, point in zip(meshes, meshes_origin, points):
+                    mesh.points += point
+                    allocated_meshes.append(mesh)
+                    mesh_origin.points += point
+                    allocated_origin_meshes.append(mesh_origin)
+            except Exception as e:
+                print(f"统一缩放系统位置分配失败，回退到原有实现: {e}")
+                for mesh, mesh_origin, point in zip(meshes, meshes_origin, points):
+                    mesh.points += point
+                    allocated_meshes.append(mesh)
+                    mesh_origin.points += point
+                    allocated_origin_meshes.append(mesh_origin)
 
             with open(os.path.join(base_path, 'names_points.csv'), 'w', newline='') as file:
                 writer = csv.writer(file)
