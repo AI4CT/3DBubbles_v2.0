@@ -135,6 +135,15 @@ if __name__ == '__main__':
     parser.add_argument('--gpu-batch-size', type=int, default=16, help='GPU批处理大小')
     parser.add_argument('--gpu-performance-report', action='store_true', help='显示GPU性能报告')
 
+    # StyleID 渲染增强参数
+    parser.add_argument('--enable_styleid', action='store_true', default=True, help='启用StyleID渲染增强（以3D渲染为内容图、pre_stitch气泡为风格图做在线风格迁移）')
+    parser.add_argument('--styleid_repo_dir', type=str, default=r"/home/yubd/mount/codebase/StyleID", help='StyleID仓库路径')
+    parser.add_argument('--styleid_model_config', type=str, default=r"/home/yubd/mount/codebase/StyleID/models/ldm/stable-diffusion-v1/v1-inference.yaml", help='StyleID SD模型配置文件路径')
+    parser.add_argument('--styleid_model_ckpt', type=str, default=r"/home/yubd/mount/codebase/StyleID/models/ldm/stable-diffusion-v1/v1-5-pruned-emaonly.ckpt", help='StyleID SD模型权重路径')
+    parser.add_argument('--styleid_start_step', type=int, default=40, help='StyleID风格注入起始步（默认40，值越大风格越强）')
+    parser.add_argument('--styleid_gamma', type=float, default=0.75, help='StyleID内容结构保留强度（默认0.75）')
+    parser.add_argument('--styleid_T', type=float, default=2.0, help='StyleID注意力温度缩放（默认2.0）')
+
     args = parser.parse_args()
 
     # 处理预生成数据集参数
@@ -242,7 +251,15 @@ if __name__ == '__main__':
             gpu_ids=gpu_ids,
             max_gpus=max_gpus,
             enable_gpu_acceleration=enable_gpu_acceleration,
-            gpu_batch_size=gpu_batch_size
+            gpu_batch_size=gpu_batch_size,
+            # StyleID 渲染增强参数
+            enable_styleid=args.enable_styleid,
+            styleid_repo_dir=args.styleid_repo_dir,
+            styleid_model_config=args.styleid_model_config,
+            styleid_model_ckpt=args.styleid_model_ckpt,
+            styleid_start_step=args.styleid_start_step,
+            styleid_gamma=args.styleid_gamma,
+            styleid_T=args.styleid_T,
         )
 
         print(f"第 {num + 1} 个流场生成完成，保存至: {base_path}")

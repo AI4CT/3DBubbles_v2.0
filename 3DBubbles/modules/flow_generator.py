@@ -248,7 +248,7 @@ def process_projection(mp_args):
         None
     """
     (i_projection, point_fibonacci, allocated_meshes, allocated_origin_meshes, base_path, gas_holdup, v, scale, alpha, truncation, enable_hq_generation, enable_bubble_composition,
-     use_pregenerated_dataset, bubble_selector, filtering_params, gpu_ids, max_gpus, enable_gpu_acceleration, gpu_batch_size) = mp_args
+     use_pregenerated_dataset, bubble_selector, filtering_params, gpu_ids, max_gpus, enable_gpu_acceleration, gpu_batch_size, styleid_enhancer) = mp_args
     masks_path = os.path.join(base_path, f'{str(i_projection).zfill(3)}/masks')
     if not os.path.exists(masks_path):
         os.makedirs(masks_path)
@@ -782,7 +782,8 @@ def process_projection(mp_args):
                         # 传递原始渲染的坐标参数
                         min_x=min_x,
                         min_y=min_y,
-                        auto_adjust_canvas=False  # 禁用：canvas_range_x/y已精确覆盖流场，auto_adjust混用旋转前后坐标系会导致尺寸错误
+                        auto_adjust_canvas=False,  # 禁用：canvas_range_x/y已精确覆盖流场，auto_adjust混用旋转前后坐标系会导致尺寸错误
+                        styleid_enhancer=styleid_enhancer,
                     )
 
                     success_count = composition_results.get('successful_compositions', 0)
@@ -828,7 +829,9 @@ def generater(stl_files, base_path, volume_size_x, volume_size_y, volume_height,
               use_pregenerated_dataset=True, pregenerated_image_dir=None, pregenerated_struct_csv=None,
               a_tolerance=0.1, b_tolerance=0.1, cx_tolerance=5.0, cy_tolerance=5.0, sr_tolerance=0.1,
               enable_iou_filtering=True, iou_threshold=0.3, min_similarity_score=0.5, screening_pool_size=10000,
-              gpu_ids=None, max_gpus=4, enable_gpu_acceleration=True, gpu_batch_size=16):
+              gpu_ids=None, max_gpus=4, enable_gpu_acceleration=True, gpu_batch_size=16,
+              enable_styleid=False, styleid_repo_dir=None, styleid_model_config=None, styleid_model_ckpt=None,
+              styleid_start_step=40, styleid_gamma=0.75, styleid_T=2.0):
     """
     主要的流场生成函数
 
@@ -877,6 +880,27 @@ def generater(stl_files, base_path, volume_size_x, volume_size_y, volume_height,
             use_pregenerated_dataset = False
     else:
         print("使用传统CPU筛选模式")
+
+    # 初始化 StyleID 增强器（仅在 enable_styleid=True 且 enable_bubble_composition=True 时加载）
+    styleid_enhancer = None
+    if enable_styleid and enable_bubble_composition:
+        try:
+            from .styleid_enhancement import StyleIDEnhancer
+            print("正在加载 StyleID 模型...")
+            styleid_enhancer = StyleIDEnhancer(
+                styleid_repo_dir=styleid_repo_dir,
+                model_config=styleid_model_config,
+                model_ckpt=styleid_model_ckpt,
+                start_step=styleid_start_step,
+                gamma=styleid_gamma,
+                T=styleid_T,
+            )
+            print("StyleID 模型加载完成")
+        except Exception as e:
+            import traceback
+            print(f"StyleID 模型加载失败，跳过渲染增强: {e}")
+            traceback.print_exc()
+            styleid_enhancer = None
         use_pregenerated_dataset = False
 
     try:
@@ -1014,7 +1038,7 @@ def generater(stl_files, base_path, volume_size_x, volume_size_y, volume_height,
 
                 # 调用单个投影处理函数
                 mp_args = (i_projection, point_fibonacci, allocated_meshes, allocated_origin_meshes, base_path, gas_holdup, v, scale, alpha, truncation, enable_hq_generation, enable_bubble_composition,
-                          use_pregenerated_dataset, bubble_selector, filtering_params, gpu_ids, max_gpus, enable_gpu_acceleration, gpu_batch_size)
+                          use_pregenerated_dataset, bubble_selector, filtering_params, gpu_ids, max_gpus, enable_gpu_acceleration, gpu_batch_size, styleid_enhancer)
                 process_projection(mp_args)
 
                 print(f"视角 {i_projection + 1} 处理完成")
@@ -1039,6 +1063,9 @@ def generater(stl_files, base_path, volume_size_x, volume_size_y, volume_height,
             shutil.copy(current_file_path, destination_path)
 
     finally:
+        # 释放 StyleID 模型显存
+        if styleid_enhancer is not None:
+            styleid_enhancer.cleanup()
         # 最终内存清理（GPU资源清理代码已移除）
         gc.collect()
         print("资源清理完成")

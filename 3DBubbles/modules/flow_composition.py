@@ -501,9 +501,13 @@ def apply_visual_enhancement(roi, img_fg, mask_with_contour, contour,
     """
     results = {}
 
+    # 保证 roi 与 img_fg 通道数一致（background 为3通道，img_fg 为灰度）
+    need_gray = roi.ndim == 3 and img_fg.ndim == 2
+    roi_proc = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if need_gray else roi
+
     # 基础合成
     mask_inv = cv2.bitwise_not(mask_with_contour)
-    img_bg = cv2.bitwise_and(roi, roi, mask=mask_inv)
+    img_bg = cv2.bitwise_and(roi_proc, roi_proc, mask=mask_inv)
     dst = cv2.add(img_bg, img_fg)
     results['basic'] = dst
 
@@ -520,7 +524,7 @@ def apply_visual_enhancement(roi, img_fg, mask_with_contour, contour,
         for point in origin_contour:
             if (point[1]-semi >= 0 and point[1]+semi < dst_local_gauss.shape[0] and
                 point[0]-semi >= 0 and point[0]+semi < dst_local_gauss.shape[1]):
-                mini_dst_local_gauss = dst_local_gauss[point[1]-semi:point[1]+semi, point[0]-semi:point[0]+semi,:]
+                mini_dst_local_gauss = dst_local_gauss[point[1]-semi:point[1]+semi, point[0]-semi:point[0]+semi]
                 mini_dst_local_gauss = cv2.GaussianBlur(mini_dst_local_gauss, (kernel_gauss, kernel_gauss), 0)
                 dst_local_gauss[point[1]-semi:point[1]+semi, point[0]-semi:point[0]+semi] = mini_dst_local_gauss
 
@@ -540,12 +544,16 @@ def apply_visual_enhancement(roi, img_fg, mask_with_contour, contour,
         for point in origin_contour:
             if (point[1]-semi >= 0 and point[1]+semi < dst_local_median.shape[0] and
                 point[0]-semi >= 0 and point[0]+semi < dst_local_median.shape[1]):
-                mini_dst_local_median = dst_local_median[point[1]-semi:point[1]+semi, point[0]-semi:point[0]+semi,:]
+                mini_dst_local_median = dst_local_median[point[1]-semi:point[1]+semi, point[0]-semi:point[0]+semi]
                 mini_dst_local_median = cv2.medianBlur(mini_dst_local_median, kernel_median)
                 dst_local_median[point[1]-semi:point[1]+semi, point[0]-semi:point[0]+semi] = mini_dst_local_median
 
         results['global_median'] = dst_global_median
         results['local_median'] = dst_local_median
+
+    # 如果 roi 原为3通道，将所有结果转回3通道以匹配画布
+    if need_gray:
+        results = {k: cv2.cvtColor(v, cv2.COLOR_GRAY2BGR) for k, v in results.items()}
 
     return results
 
@@ -557,7 +565,8 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                                    threshold=50, enable_gauss=True, enable_median=True,
                                    save_outputs=True, use_3d_positions=True,
                                    min_x=None, min_y=None, auto_adjust_canvas=True,
-                                   save_pre_stitch=True):
+                                   save_pre_stitch=True,
+                                   styleid_enhancer=None):
     """
     生成完整的流场合成图像（参考generate_flow_field_overlap.py的实现）
 
@@ -720,6 +729,12 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
             pre_stitch_dir = os.path.join(projection_dir, 'pre_stitch_bubbles')
             os.makedirs(pre_stitch_dir, exist_ok=True)
 
+        # StyleID 增强后图像保存目录
+        styleid_dir = None
+        if styleid_enhancer is not None:
+            styleid_dir = os.path.join(projection_dir, 'styleid_renders')
+            os.makedirs(styleid_dir, exist_ok=True)
+
         for item in sorted_items:
             if len(item) == 4:
                 image_rel_path, analysis_result, bubble_3d_pos, bubble_idx = item
@@ -850,12 +865,79 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 main_contour = tc
 
                 # 保存拼接前的单气泡图像（旋转+坐标对齐后的最终状态）
+                pre_stitch_path = None
                 if save_pre_stitch and pre_stitch_dir is not None:
                     pre_stitch_vis = cv2.bitwise_not(rotated_img)
                     bg_region = cv2.bitwise_not(mask_with_contour)
                     pre_stitch_vis[bg_region > 0] = 255
                     save_name = f'pre_stitch_{bubble_idx:03d}_angle{angle:.1f}.png'
-                    cv2.imwrite(os.path.join(pre_stitch_dir, save_name), pre_stitch_vis)
+                    pre_stitch_path = os.path.join(pre_stitch_dir, save_name)
+                    cv2.imwrite(pre_stitch_path, pre_stitch_vis)
+
+                # StyleID 渲染增强：以 single_bubble_renders 中的原始 3D 渲染为内容图，
+                # 以 pre_stitch_bubbles 中旋转对齐后的高质量气泡为风格图，在线增强 rotated_img
+                if styleid_enhancer is not None:
+                    try:
+                        # image_rel_path 是相对于 base_path 的路径（如 000/single_bubble_renders/bubble_000.png）
+                        # projection_dir = base_path/000，所以 base_path = dirname(projection_dir)
+                        base_path = os.path.dirname(projection_dir)
+                        cnt_path = os.path.join(base_path, image_rel_path)
+                        if os.path.exists(cnt_path):
+                            cnt_img = cv2.imread(cnt_path, cv2.IMREAD_GRAYSCALE)
+                        else:
+                            cnt_img = None
+
+                        # 风格图：优先使用已保存的 pre_stitch 图像，否则直接用 rotated_img
+                        if pre_stitch_path is not None and os.path.exists(pre_stitch_path):
+                            sty_img = cv2.imread(pre_stitch_path, cv2.IMREAD_GRAYSCALE)
+                        else:
+                            sty_img = rotated_img
+
+                        if cnt_img is not None and sty_img is not None:
+                            enhanced = styleid_enhancer.enhance(cnt_img, sty_img)
+                            # 强制转为 uint8 灰度 2D 数组
+                            if enhanced.ndim == 3:
+                                enhanced = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY) if enhanced.shape[2] == 3 else enhanced[:, :, 0]
+                            enhanced = enhanced.astype(np.uint8)
+                            # 确保空间尺寸与原 rotated_img 完全一致
+                            target_h, target_w = rotated_img.shape[:2]
+                            if enhanced.shape[0] != target_h or enhanced.shape[1] != target_w:
+                                enhanced = cv2.resize(enhanced, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
+                            # 方案1：StyleID 输出完整替代气泡（包括形状），
+                            # 从 StyleID 输出重新生成 mask_with_contour 和 main_contour，
+                            # 彻底去掉 HQ 气泡轮廓的影响，避免双层叠加效果。
+                            # StyleID 输出为自然极性（暗气泡/亮背景），反转后得到内部约定极性（亮气泡/暗背景）。
+                            rotated_img = cv2.bitwise_not(enhanced)
+                            _, new_mask = cv2.threshold(rotated_img, threshold, 255, cv2.THRESH_BINARY)
+                            new_contours, _ = cv2.findContours(new_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            new_contours = sorted(new_contours, key=cv2.contourArea, reverse=True)
+                            if new_contours:
+                                main_contour = new_contours[0]
+                                mask_with_contour = np.zeros_like(new_mask)
+                                cv2.drawContours(mask_with_contour, [main_contour], -1, 255, thickness=cv2.FILLED)
+                            # 原始流程在 rotate_and_mask_bubble 之后立即对 rotated_img/mask/contour
+                            # 做 cv2.transpose（lines 860-865），但 StyleID 在该 transpose 之后才
+                            # 替换 rotated_img，因此需在此补做同样的 transpose，否则气泡方向
+                            # 比正确方向顺时针多转 90°。
+                            rotated_img = cv2.transpose(rotated_img)
+                            mask_with_contour = cv2.transpose(mask_with_contour)
+                            tc = main_contour.copy()
+                            tc[:, 0, 0] = main_contour[:, 0, 1]
+                            tc[:, 0, 1] = main_contour[:, 0, 0]
+                            main_contour = tc
+
+                            # 保存增强后的气泡图像用于检查（保存自然极性，便于肉眼验证）
+                            if styleid_dir is not None:
+                                styleid_save_name = f'styleid_{bubble_idx:03d}_angle{angle:.1f}.png'
+                                cv2.imwrite(os.path.join(styleid_dir, styleid_save_name), enhanced)
+                            print(f"    [StyleID] 气泡{bubble_idx} 增强成功，shape={rotated_img.shape}")
+                        else:
+                            print(f"    [StyleID] 气泡{bubble_idx} 跳过（内容图不存在: {cnt_path}）")
+                    except Exception as _styleid_exc:
+                        import traceback
+                        print(f"    [StyleID] 气泡{bubble_idx} 增强失败，回退原图:")
+                        traceback.print_exc()
 
                 # 生成全局掩码（边界裁剪，mask_with_contour 已转置，索引仍对应同一像素）
                 global_mask = np.zeros((height_pix + pad * 2, width_pix + pad * 2), dtype=np.uint8)
@@ -888,7 +970,13 @@ def generate_flow_field_composition(projection_dir, bubble_analysis_data,
                 roi_global_median = cut_image_out_of_range(background_global_median, x, y, crop_size=bubble_size) if enable_median else None
                 roi_local_median = cut_image_out_of_range(background_local_median, x, y, crop_size=bubble_size) if enable_median else None
 
-                # 准备前景图像
+                # 准备前景图像（显式保证 rotated_img 与 mask_with_contour 尺寸和 dtype 一致）
+                if rotated_img.shape[:2] != mask_with_contour.shape[:2]:
+                    rotated_img = cv2.resize(rotated_img, (mask_with_contour.shape[1], mask_with_contour.shape[0]),
+                                             interpolation=cv2.INTER_LANCZOS4)
+                if rotated_img.ndim == 3:
+                    rotated_img = rotated_img[:, :, 0]
+                rotated_img = rotated_img.astype(np.uint8)
                 img_fg = cv2.bitwise_and(rotated_img, rotated_img, mask=mask_with_contour)
 
                 # 应用视觉增强（contour 坐标与 rotated_img 完全对齐）
